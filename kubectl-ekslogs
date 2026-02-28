@@ -7,8 +7,10 @@
 
 set -euo pipefail
 
-readonly VERSION="0.2.0"
+readonly VERSION="0.3.0"
 readonly DEFAULT_TIMEOUT="300s"
+readonly DEFAULT_DEBUG_IMAGE="public.ecr.aws/docker/library/busybox:stable-uclibc"
+readonly POD_LABEL="app.kubernetes.io/managed-by=kubectl-ekslogs"
 
 # --- Colors & Formatting ------------------------------------------------
 
@@ -42,6 +44,8 @@ FLAGS
     -l, --selector <selector>  Select nodes by label (same syntax as kubectl -l)
     -t, --timeout <duration>   Timeout for log collection (default: ${DEFAULT_TIMEOUT})
     -o, --output-dir <path>    Directory to save log bundles (default: current directory)
+        --no-proxy             Use a debug pod and kubectl cp instead of the node proxy API
+        --debug-image <image>  Container image for debug pod (default: ${DEFAULT_DEBUG_IMAGE})
     -h, --help                 Show this help message
     -v, --version              Show version information
 
@@ -49,17 +53,14 @@ EXAMPLES
     # Collect logs from a single node
     kubectl ekslogs ip-10-0-1-42.ec2.internal
 
-    # Collect logs from multiple nodes
-    kubectl ekslogs ip-10-0-1-42.ec2.internal ip-10-0-1-43.ec2.internal
-
     # Collect logs from all nodes in a node group
     kubectl ekslogs -l eks.amazonaws.com/nodegroup=my-node-group
 
-    # Collect logs from all nodes with a specific instance type
-    kubectl ekslogs -l node.kubernetes.io/instance-type=m5.xlarge
+    # Use debug pod transfer (no node proxy API required)
+    kubectl ekslogs --no-proxy ip-10-0-1-42.ec2.internal
 
-    # Combine label selector with a custom timeout
-    kubectl ekslogs -l role=worker --timeout 600s
+    # Use debug pod with a custom image
+    kubectl ekslogs --no-proxy --debug-image alpine:3.19 ip-10-0-1-42.ec2.internal
 
     # Collect logs with a custom timeout and output directory
     kubectl ekslogs --timeout 600s --output-dir /tmp/logs ip-10-0-1-42.ec2.internal
@@ -67,6 +68,7 @@ EXAMPLES
 PREREQUISITES
     - kubectl configured with access to an EKS cluster
     - The EKS NodeDiagnostic API (eks.amazonaws.com/v1alpha1) must be available
+    - When using --no-proxy: permissions to create pods with hostPath volumes
 EOF
 }
 
@@ -74,14 +76,29 @@ version() {
     echo "kubectl-ekslogs v${VERSION}"
 }
 
+# Convert node name to a valid pod name (lowercase, no dots, max 63 chars)
+sanitize_pod_name() {
+    local node="$1"
+    echo "ekslogs-${node}" | tr '.' '-' | tr '[:upper:]' '[:lower:]' | cut -c1-63 | sed 's/-$//'
+}
+
 cleanup() {
     local exit_code=$?
+
+    if [[ ${#TRANSFER_PODS[@]} -gt 0 ]]; then
+        warn "Cleaning up transfer pods..."
+        for pod in "${TRANSFER_PODS[@]}"; do
+            kubectl delete pod "$pod" --ignore-not-found >/dev/null 2>&1 || true
+        done
+    fi
+
     if [[ ${#NODE_NAMES[@]} -gt 0 ]]; then
-        warn "Interrupted — cleaning up NodeDiagnostic resources..."
+        warn "Cleaning up NodeDiagnostic resources..."
         for node in "${NODE_NAMES[@]}"; do
             kubectl delete nodediagnostic "$node" --ignore-not-found >/dev/null 2>&1 || true
         done
     fi
+
     exit "$exit_code"
 }
 
@@ -100,12 +117,87 @@ resolve_selector() {
     info "Selector matched ${#RESOLVED_NODES[@]} node(s): ${RESOLVED_NODES[*]}"
 }
 
+download_via_proxy() {
+    local node="$1"
+    local output_path="$2"
+
+    if ! kubectl get --raw "/api/v1/nodes/${node}/proxy/logs/support/${node}-logs.tar.gz" > "$output_path"; then
+        error "Failed to download log bundle for node: ${node}"
+        return 1
+    fi
+}
+
+download_via_debug_pod() {
+    local node="$1"
+    local output_path="$2"
+    local pod_name
+
+    pod_name=$(sanitize_pod_name "$node")
+    TRANSFER_PODS+=("$pod_name")
+
+    status "Creating transfer pod ${pod_name} on node ${node}..."
+
+    cat <<EOF | kubectl apply -f - >/dev/null 2>&1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  labels:
+    app.kubernetes.io/managed-by: kubectl-ekslogs
+    app.kubernetes.io/component: log-transfer
+spec:
+  nodeName: ${node}
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: transfer
+      image: ${DEBUG_IMAGE}
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      volumeMounts:
+        - name: host-logs
+          mountPath: /host-logs
+          readOnly: true
+  volumes:
+    - name: host-logs
+      hostPath:
+        path: /var/log
+        type: Directory
+EOF
+
+    status "Waiting for transfer pod ${pod_name} to be ready..."
+    if ! kubectl wait --for=condition=Ready "pod/${pod_name}" --timeout=120s >/dev/null 2>&1; then
+        error "Transfer pod ${pod_name} failed to become ready"
+        kubectl delete pod "$pod_name" --ignore-not-found >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    status "Copying log bundle from ${pod_name}..."
+    if ! kubectl cp "${pod_name}:/host-logs/support/${node}-logs.tar.gz" "$output_path" 2>/dev/null; then
+        error "Failed to copy log bundle from pod ${pod_name}"
+        kubectl delete pod "$pod_name" --ignore-not-found >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    kubectl delete pod "$pod_name" --ignore-not-found >/dev/null 2>&1 || true
+}
+
 # --- Argument Parsing ----------------------------------------------------
 
 TIMEOUT="${DEFAULT_TIMEOUT}"
 OUTPUT_DIR="."
 NODE_NAMES=()
+TRANSFER_PODS=()
 SELECTOR=""
+NO_PROXY=false
+DEBUG_IMAGE="${DEFAULT_DEBUG_IMAGE}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -130,6 +222,15 @@ while [[ $# -gt 0 ]]; do
         -o|--output-dir)
             [[ -z "${2:-}" ]] && { error "Flag --output-dir requires a value"; exit 1; }
             OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --no-proxy)
+            NO_PROXY=true
+            shift
+            ;;
+        --debug-image)
+            [[ -z "${2:-}" ]] && { error "Flag --debug-image requires a value"; exit 1; }
+            DEBUG_IMAGE="$2"
             shift 2
             ;;
         -*)
@@ -175,6 +276,12 @@ if [[ -n "$SELECTOR" ]]; then
     RESOLVED_NODES=()
     resolve_selector "$SELECTOR"
     NODE_NAMES=("${RESOLVED_NODES[@]}")
+fi
+
+if [[ "$NO_PROXY" == true ]]; then
+    info "Transfer mode: debug pod (image: ${DEBUG_IMAGE})"
+else
+    info "Transfer mode: node proxy API"
 fi
 
 status "Validating node(s)..."
@@ -229,13 +336,23 @@ info "Log collection completed on all nodes"
 status "Downloading log bundles..."
 for node in "${NODE_NAMES[@]}"; do
     output_path="${OUTPUT_DIR}/${node}-logs.tar.gz"
-    if ! kubectl get --raw "/api/v1/nodes/${node}/proxy/logs/support/${node}-logs.tar.gz" > "$output_path"; then
-        error "Failed to download log bundle for node: ${node}"
-        for n in "${NODE_NAMES[@]}"; do
-            kubectl delete nodediagnostic "$n" --ignore-not-found >/dev/null 2>&1 || true
-        done
-        exit 1
+
+    if [[ "$NO_PROXY" == true ]]; then
+        if ! download_via_debug_pod "$node" "$output_path"; then
+            for n in "${NODE_NAMES[@]}"; do
+                kubectl delete nodediagnostic "$n" --ignore-not-found >/dev/null 2>&1 || true
+            done
+            exit 1
+        fi
+    else
+        if ! download_via_proxy "$node" "$output_path"; then
+            for n in "${NODE_NAMES[@]}"; do
+                kubectl delete nodediagnostic "$n" --ignore-not-found >/dev/null 2>&1 || true
+            done
+            exit 1
+        fi
     fi
+
     info "Saved: ${output_path} ($(du -h "$output_path" | cut -f1))"
 done
 
