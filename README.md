@@ -31,10 +31,12 @@ kubectl ekslogs [FLAGS] <node> [node...]
 
 | Flag | Description | Default |
 |------|-------------|---------|
+| `-l`, `--selector <selector>` | Select nodes by label (same syntax as `kubectl -l`) | — |
 | `-t`, `--timeout <duration>` | Timeout for log collection | `300s` |
 | `-o`, `--output-dir <path>` | Directory to save log bundles | `.` (current directory) |
 | `-h`, `--help` | Show help message | — |
 | `-v`, `--version` | Show version information | — |
+
 
 ### Examples
 
@@ -46,15 +48,19 @@ kubectl ekslogs ip-10-0-1-42.ec2.internal
 ```bash
 kubectl ekslogs ip-10-0-1-42.ec2.internal ip-10-0-1-43.ec2.internal
 ```
+**Collect logs from all nodes in a node group:**
+```bash
+kubectl ekslogs -l eks.amazonaws.com/nodegroup=my-node-group
+```
+**Collect logs from all nodes with a specific instance type:**
+```bash
+kubectl ekslogs -l node.kubernetes.io/instance-type=m5.xlarge
+```
 **Collect logs with a custom timeout and output directory:**
 ```bash
 kubectl ekslogs --timeout 600s --output-dir /tmp/logs ip-10-0-1-42.ec2.internal
 ```
 
-**Collect logs from all nodes in a specific node group:**
-```
-kubectl ekslogs $(kubectl get nodes -l eks.amazonaws.com/nodegroup=my-node-group -o jsonpath='{.items[*].metadata.name}')
-```
 ### Sample Output
 ```
 ⟳ Validating node(s)...
